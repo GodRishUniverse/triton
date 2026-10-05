@@ -11,6 +11,260 @@ import triton.language as tl
 from triton._internal_testing import is_cuda, is_hip, run_in_process
 
 
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer range assertion")
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32])
+def test_pointer_access_range_option_large_allocation(dtype, fresh_knobs):
+    fresh_knobs.amd.use_buffer_ops = True
+    fresh_knobs.amd.buffer_ops_analyze_small_tensor_range = False
+    if torch.cuda.mem_get_info()[0] < 3 * 2**30:
+        pytest.skip("requires 3 GiB of free GPU memory")
+
+    @triton.jit
+    def gather_scatter(src, dst, indices, SIZE: tl.constexpr):
+        lanes = tl.arange(0, SIZE)
+        index = tl.load(indices + lanes)
+        value = tl.load(src + index)
+        tl.store(dst + index, value)
+
+    # Both views start past 2 GiB. Dynamic indices prevent static range analysis
+    # from proving the loads/stores safe for buffer addressing on its own.
+    size = 256
+    nbytes = size * torch.empty((), dtype=dtype).element_size()
+    storage = torch.empty(2**31 + 2 * nbytes, dtype=torch.uint8, device="cuda")
+    src = storage[2**31:2**31 + nbytes].view(dtype)
+    dst = storage[2**31 + nbytes:].view(dtype)
+    values = torch.arange(size, device="cuda").to(dtype)
+    src.copy_(values)
+    indices = torch.arange(size - 1, -1, -1, dtype=torch.int32, device="cuda")
+
+    default = gather_scatter[(1, )](src, dst, indices, size)
+    torch.testing.assert_close(dst, values, atol=0, rtol=0)
+    assert "global_load" in default.asm["amdgcn"]
+    assert "global_store" in default.asm["amdgcn"]
+
+    dst.zero_()
+    bounded = gather_scatter[(1, )](src, dst, indices, size, assume_pointer_access_range_32=('src', 'dst'))
+    torch.testing.assert_close(dst, values, atol=0, rtol=0)
+    assert "tt.pointer_access_range = 32" in bounded.asm["ttir"]
+    assert "global_load" not in bounded.asm["amdgcn"]
+    assert "global_store" not in bounded.asm["amdgcn"]
+    assert "buffer_load" in bounded.asm["amdgcn"]
+    assert "buffer_store" in bounded.asm["amdgcn"]
+    assert bounded is not default
+    assert gather_scatter[(1, )](src, dst, indices, size) is default
+    assert gather_scatter[(1, )](src, dst, indices, size, assume_pointer_access_range_32=('src', 'dst')) is bounded
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer range assertion")
+@pytest.mark.parametrize("names", [("index", ), ("missing", )])
+def test_pointer_access_range_option_non_pointer_argument(names):
+
+    @triton.jit
+    def kernel(out, index):
+        tl.store(out + index, 1)
+
+    out = torch.empty(32, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="scalar source pointer|does not exist"):
+        kernel[(1, )](out, 3, assume_pointer_access_range_32=names)
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD conservative pointer range default")
+def test_pointer_range_default_access_beyond_view(fresh_knobs):
+    fresh_knobs.amd.use_buffer_ops = True
+    if torch.cuda.mem_get_info()[0] < 3 * 2**30:
+        pytest.skip("requires 3 GiB of free GPU memory")
+
+    @triton.jit
+    def kernel(src, out, indices):
+        lanes = tl.arange(0, 16)
+        index = tl.load(indices + lanes)
+        tl.store(out + lanes, tl.load(src + index))
+
+    storage = torch.empty(2**31 + 16, dtype=torch.uint8, device="cuda")
+    storage[2**31:].fill_(123)
+    # Triton receives a pointer, so this is a valid read within its allocation
+    # even though the view shape does not describe the addresses being read.
+    view = storage[:16]
+    indices = torch.arange(2**31, 2**31 + 16, dtype=torch.int64, device="cuda")
+    out = torch.empty(16, dtype=torch.uint8, device="cuda")
+    compiled = kernel[(1, )](view, out, indices)
+    torch.testing.assert_close(out, torch.full_like(out, 123), atol=0, rtol=0)
+    assert "global_load" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer access range assertion")
+@pytest.mark.parametrize("small_storage", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["i64", "i32_chain", "i32_wrap", "select", "if", "loop", "trans", "unknown_if", "masked", "cancel"])
+def test_pointer_access_range_preserves_pointer_values(mode, small_storage, fresh_knobs):
+    fresh_knobs.amd.use_buffer_ops = True
+    fresh_knobs.amd.buffer_ops_analyze_small_tensor_range = False
+    if not small_storage and torch.cuda.mem_get_info()[0] < 3 * 2**30:
+        pytest.skip("requires 3 GiB of free GPU memory")
+
+    @triton.jit
+    def kernel(src, other, offsets, out, MODE: tl.constexpr):
+        lanes = tl.arange(0, 4)
+        value = tl.load(src + lanes)
+        offset = tl.load(offsets + lanes)
+        if MODE == "i64":
+            pointer = src + offset
+        elif MODE == "i32_chain":
+            pointer = src + offset.to(tl.int32)
+            pointer = pointer + offset.to(tl.int32)
+        elif MODE == "i32_wrap":
+            wrapped = offset.to(tl.int32) + lanes
+            pointer = src + wrapped
+        elif MODE == "select":
+            pointer = tl.where(tl.load(offsets) > 0, src + offset, other + offset)
+        elif MODE == "if":
+            if tl.load(offsets) > 0:
+                pointer = src + offset
+            else:
+                pointer = other + offset
+        elif MODE == "trans":
+            matrix = src + tl.reshape(offset, (2, 2))
+            pointer = tl.reshape(tl.trans(matrix), (4, ))
+        elif MODE == "unknown_if":
+            if tl.load(offsets) > 0:
+                pointer = src + offset
+            else:
+                pointer = (src.to(tl.uint64) + offset.to(tl.uint64)).to(tl.pointer_type(tl.uint8))
+        elif MODE == "masked":
+            pointer = src + offset
+            value = tl.load(pointer, lanes == 0, 77)
+        elif MODE == "cancel":
+            pointer = src + offset
+            pointer = pointer - offset + lanes
+        else:
+            pointer = src + lanes
+            for _ in range(2):
+                pointer = tl.where(tl.load(offsets) > 0, pointer, other + lanes)
+                pointer = pointer + offset.to(tl.int32)
+        delta = pointer.to(tl.uint64) - src.to(tl.uint64)
+        tl.store(out + lanes, delta.to(tl.int64))
+        tl.store(out + 4 + lanes, value.to(tl.int64))
+
+    # Far pointer values are observed, but the only selected live accesses read
+    # bytes 0..3. The small-storage case also carries the ordinary S attribute.
+    src = torch.empty(16 if small_storage else 2**31 + 16, device="cuda", dtype=torch.uint8)
+    src[:4].copy_(torch.arange(4, device="cuda", dtype=torch.uint8))
+    other = torch.empty(16, device="cuda", dtype=torch.uint8)
+    if mode in ("i64", "select", "if", "trans", "unknown_if", "masked", "cancel"):
+        offsets = torch.arange(2**31, 2**31 + 4, device="cuda", dtype=torch.int64)
+        expected = list(range(2**31, 2**31 + 4))
+        if mode == "trans":
+            expected = [2**31, 2**31 + 2, 2**31 + 1, 2**31 + 3]
+        elif mode == "masked":
+            offsets[0] = 0
+            offsets[1] = -1
+            expected[0] = 0
+            expected[1] = -1
+        elif mode == "cancel":
+            expected = list(range(4))
+    elif mode == "i32_wrap":
+        offsets = torch.full((4, ), 2**31 - 1, device="cuda", dtype=torch.int64)
+        expected = [2**31 - 1, -2**31, -2**31 + 1, -2**31 + 2]
+    else:
+        offsets = torch.full((4, ), 2**30, device="cuda", dtype=torch.int64)
+        expected = [2**31 + i if mode == "loop" else 2**31 for i in range(4)]
+    out = torch.empty(8, device="cuda", dtype=torch.int64)
+    compiled = kernel[(1, )](src, other, offsets, out, mode, assume_pointer_access_range_32=("src", ))
+    assert out.cpu().tolist() == expected + ([0, 77, 77, 77] if mode == "masked" else list(range(4)))
+    assert "tt.pointer_access_range = 32" in compiled.asm["ttir"]
+    assert "buffer_load" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer access range assertion")
+@pytest.mark.parametrize("mode", ["select", "if", "loop"])
+@pytest.mark.parametrize("choose_src", [False, True])
+def test_pointer_access_range_mixed_origins(mode, choose_src, fresh_knobs):
+    fresh_knobs.amd.use_buffer_ops = True
+    fresh_knobs.amd.buffer_ops_analyze_small_tensor_range = False
+
+    @triton.jit
+    def kernel(src, other, offsets, out, choose, MODE: tl.constexpr):
+        lanes = tl.arange(0, 4)
+        offset = tl.load(offsets + lanes)
+        if MODE == "select":
+            pointer = tl.where(choose, src + offset, other + offset)
+        elif MODE == "if":
+            if choose:
+                pointer = src + offset
+            else:
+                pointer = other + offset
+        else:
+            pointer = src + lanes
+            for _ in range(2):
+                pointer = tl.where(choose, pointer, other + offset)
+        values = tl.load(pointer)
+        delta = pointer.to(tl.uint64) - src.to(tl.uint64)
+        tl.store(out + lanes, delta.to(tl.int64))
+        tl.store(out + 4 + lanes, values.to(tl.int64))
+
+    src = torch.arange(16, device="cuda", dtype=torch.uint8)
+    other = torch.arange(16, device="cuda", dtype=torch.uint8) + 100
+    offsets = torch.arange(4, device="cuda", dtype=torch.int64)
+    out = torch.empty(8, device="cuda", dtype=torch.int64)
+    kernel[(1, )](src, other, offsets, out, choose_src, mode, assume_pointer_access_range_32=("src", ))
+    base_delta = 0 if choose_src else other.data_ptr() - src.data_ptr()
+    expected = [base_delta + i for i in range(4)] + [i + (0 if choose_src else 100) for i in range(4)]
+    assert out.cpu().tolist() == expected
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer access range assertion")
+def test_pointer_access_range_full_width_boundary(fresh_knobs):
+    fresh_knobs.amd.use_buffer_ops = True
+    fresh_knobs.amd.buffer_ops_analyze_small_tensor_range = False
+    if torch.cuda.mem_get_info()[0] < 3 * 2**30:
+        pytest.skip("requires 3 GiB of free GPU memory")
+
+    @triton.jit
+    def kernel(src, offsets, out):
+        lanes = tl.arange(0, 4)
+        offset = tl.load(offsets + lanes)
+        tl.store(out + lanes, tl.load(src + offset))
+
+    src = torch.empty(2**29 + 4, device="cuda", dtype=torch.float32)
+    # The last live access ends at byte 2**31 - 4, inside the exclusive bound.
+    offsets = torch.arange(2**29 - 5, 2**29 - 1, device="cuda", dtype=torch.int64)
+    src[offsets] = torch.arange(4, device="cuda", dtype=torch.float32) + 7
+    out = torch.empty(4, device="cuda", dtype=torch.float32)
+    compiled = kernel[(1, )](src, offsets, out, assume_pointer_access_range_32=("src", ))
+    torch.testing.assert_close(out, torch.arange(4, device="cuda", dtype=torch.float32) + 7, atol=0, rtol=0)
+    assert "buffer_load" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip(), reason="AMD pointer access range assertion")
+@pytest.mark.parametrize("kind", ["tuple", "descriptor", "constexpr", "gluon"])
+def test_pointer_access_range_rejects_unsupported_arguments(kind):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+
+    @triton.jit
+    def kernel(arg, out, SIZE: tl.constexpr):
+        tl.store(out, SIZE)
+
+    @gluon.jit
+    def gluon_kernel(arg, out, SIZE: gl.constexpr):
+        gl.store(out, SIZE)
+
+    out = torch.empty(32, device="cuda", dtype=torch.int32)
+    arg = out
+    names = ("arg", )
+    if kind == "tuple":
+        arg = (out, out)
+    elif kind == "descriptor":
+        arg = TensorDescriptor(out, [32], [1], [32])
+    elif kind == "constexpr":
+        names = ("SIZE", )
+    else:
+        kernel = gluon_kernel
+    with pytest.raises(ValueError, match="scalar source pointer|not Gluon"):
+        kernel[(1, )](arg, out, 32, assume_pointer_access_range_32=names)
+
+
 def test_metadata() -> None:
 
     used_hook = False

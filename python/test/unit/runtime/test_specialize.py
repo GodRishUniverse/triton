@@ -6,7 +6,7 @@ from triton._C.libtriton import native_specialize_impl
 from triton.runtime.jit import MockTensor, JITCallable
 from triton._utils import canonicalize_dtype
 from triton.backends.nvidia.compiler import CUDABackend
-from triton.backends.amd.compiler import HIPBackend
+from triton.backends.amd.compiler import HIPBackend, HIPOptions
 from triton.language import constexpr
 from triton.language import target_info
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -187,3 +187,29 @@ def test_specialize_impl(input_generator, backend, is_const, specialize_value, a
         result = native_specialize_impl(backend, arg, is_const, specialize_value, align)
         expected = reference_specialize_impl(backend, arg, is_const, specialize_value, align)
         assert result == expected
+
+
+@pytest.mark.parametrize("names", [(0, ), (True, ), ("", ), (0.5, ), "src"])
+def test_pointer_access_range_option_invalid_names(names):
+    with pytest.raises(ValueError, match="source argument names"):
+        HIPOptions(arch="gfx1201", assume_pointer_access_range_32=names)
+
+
+def test_pointer_access_range_option_preserves_storage_specialization():
+    from triton import knobs
+
+    # Shape alone cannot constrain the addresses a kernel computes. An explicit
+    # compiler assertion must not change the specialization of ordinary views.
+    storage = torch.empty(2**31 + 4096, dtype=torch.uint8, device="meta")
+    view = storage[2**31:]
+    assert not HIPBackend.is_within_2gb(view)
+    with knobs.amd.scope():
+        knobs.amd.use_buffer_ops = True
+        assert "S" not in native_specialize_impl(HIPBackend, view, False, True, True)[1]
+
+    options = HIPOptions(arch="gfx1201",
+                         assume_pointer_access_range_32=("value_cache_ptr", "key_cache_ptr", "value_cache_ptr"))
+    assert options.assume_pointer_access_range_32 == ("key_cache_ptr", "value_cache_ptr")
+    assert options.hash() == HIPOptions(arch="gfx1201",
+                                        assume_pointer_access_range_32=("key_cache_ptr", "value_cache_ptr")).hash()
+    assert options.hash() != HIPOptions(arch="gfx1201").hash()

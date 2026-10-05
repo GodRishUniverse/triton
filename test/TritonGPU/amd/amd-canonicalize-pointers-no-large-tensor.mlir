@@ -61,3 +61,71 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// An access assertion overrides ordinary S specialization, including for the
+// unselected small pointer at this join. Preserve i32 overflow before sext and
+// accumulate separate pointer additions in i64.
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @access_range_mixed_join
+  tt.func @access_range_mixed_join(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32, tt.pointer_range = 32 : i32}, %b: !tt.ptr<i8> {tt.pointer_range = 32 : i32}, %x: i32, %y: i32, %cond: i1) -> i64 {
+    // CHECK: %[[WRAP:.*]] = arith.addi %arg2, %arg3 : i32
+    // CHECK: %[[EXT:.*]] = arith.extsi %[[WRAP]] : i32 to i64
+    // CHECK: %[[YEXT:.*]] = arith.extsi %arg3 : i32 to i64
+    // CHECK: %[[SUM:.*]] = arith.addi %[[EXT]], %[[YEXT]] : i64
+    // CHECK: %[[BASE:.*]] = arith.select %arg4, %arg0, %arg1 : !tt.ptr<i8>
+    // CHECK: %[[OFFSET:.*]] = arith.select %arg4, %[[SUM]], %{{.*}} : i64
+    // CHECK: %[[PTR:.*]] = tt.addptr %[[BASE]], %[[OFFSET]] : !tt.ptr<i8>, i64
+    // CHECK: tt.ptr_to_int %[[PTR]]
+    %wrapped = arith.addi %x, %y : i32
+    %ap = tt.addptr %a, %wrapped : !tt.ptr<i8>, i32
+    %aq = tt.addptr %ap, %y : !tt.ptr<i8>, i32
+    %bp = tt.addptr %b, %wrapped : !tt.ptr<i8>, i32
+    %bq = tt.addptr %bp, %y : !tt.ptr<i8>, i32
+    %p = arith.select %cond, %aq, %bq : !tt.ptr<i8>
+    %i = tt.ptr_to_int %p : !tt.ptr<i8> -> i64
+    tt.return %i : i64
+  }
+}
+
+// -----
+
+// Unsupported pointer forms retain the entire original pointer expression.
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @access_range_trans_fallback
+  // CHECK: tt.addptr {{.*}} tensor<2x2xi32>
+  // CHECK: tt.trans
+  // CHECK: tt.ptr_to_int
+  // CHECK-NOT: arith.extsi
+  tt.func @access_range_trans_fallback(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32, tt.pointer_range = 32 : i32}, %offset: tensor<2x2xi32>) -> tensor<2x2xi64> {
+    %base = tt.splat %a : !tt.ptr<i8> -> tensor<2x2x!tt.ptr<i8>>
+    %p = tt.addptr %base, %offset : tensor<2x2x!tt.ptr<i8>>, tensor<2x2xi32>
+    %t = tt.trans %p {order = array<i32: 1, 0>} : tensor<2x2x!tt.ptr<i8>> -> tensor<2x2x!tt.ptr<i8>>
+    %i = tt.ptr_to_int %t : tensor<2x2x!tt.ptr<i8>> -> tensor<2x2xi64>
+    tt.return %i : tensor<2x2xi64>
+  }
+}
+
+// -----
+
+// A while carrying ordinary bool state retains its original pointer form.
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @access_range_bool_while_fallback
+  // CHECK: scf.while {{.*}} : (!tt.ptr<i8>, i1) -> !tt.ptr<i8>
+  // CHECK: scf.condition
+  // CHECK: tt.addptr {{.*}} !tt.ptr<i8>, i32
+  tt.func @access_range_bool_while_fallback(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}, %cond: i1) -> i64 {
+    %false = arith.constant false
+    %one = arith.constant 1 : i32
+    %p, %c = scf.while (%pointer = %a, %live = %cond) : (!tt.ptr<i8>, i1) -> (!tt.ptr<i8>, i1) {
+      scf.condition(%live) %pointer, %live : !tt.ptr<i8>, i1
+    } do {
+    ^bb0(%pointer: !tt.ptr<i8>, %live: i1):
+      %next = tt.addptr %pointer, %one : !tt.ptr<i8>, i32
+      scf.yield %next, %false : !tt.ptr<i8>, i1
+    }
+    %i = tt.ptr_to_int %p : !tt.ptr<i8> -> i64
+    tt.return %i : i64
+  }
+}

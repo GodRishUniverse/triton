@@ -471,6 +471,8 @@ struct FatPointers {
       FatPtrAttrs result;
       result.canNarrow = lhs.canNarrow && rhs.canNarrow;
       result.isSmallTensor = lhs.isSmallTensor && rhs.isSmallTensor;
+      result.preservePointerArithmetic =
+          lhs.preservePointerArithmetic || rhs.preservePointerArithmetic;
       for (const auto &attr : lhs.attributes) {
         auto it = rhs.attributes.find(attr.first);
         if (it != rhs.attributes.end() && it->second == attr.second)
@@ -481,6 +483,9 @@ struct FatPointers {
 
     llvm::SmallMapVector<StringRef, Attribute, 2> attributes;
     bool isSmallTensor = false;
+    // Preserve original bases and full i64 offsets in functions containing an
+    // access assertion. This also keeps mixed-pointer joins type-consistent.
+    bool preservePointerArithmetic = false;
     bool canNarrow = false;
   };
 
@@ -754,6 +759,30 @@ public:
 
     RewriterBase::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(addPtrOp);
+
+    if (fatPtrs.at({fatPtrBase, fatPtrOffset}).preservePointerArithmetic) {
+      // Evaluate each original offset in its original integer width before
+      // sign-extending it, as tt.addptr does. In particular, decomposing an i32
+      // expression then widening its pieces would change overflow semantics.
+      Value offset =
+          createCastOffset(rewriter, curLoc, origOffset, rewriter.getI64Type());
+      Value combined;
+      if (isa<IntegerType>(fatPtrOffset.getType()) &&
+          isa<RankedTensorType>(offset.getType()))
+        combined = createAddUniformAndNonUniform(rewriter, curLoc, fatPtrOffset,
+                                                 offset);
+      else if (isa<RankedTensorType>(fatPtrOffset.getType()) &&
+               isa<IntegerType>(offset.getType()))
+        combined = createAddUniformAndNonUniform(rewriter, curLoc, offset,
+                                                 fatPtrOffset);
+      else
+        combined =
+            createAddOffsetsOfSameKind(rewriter, curLoc, fatPtrOffset, offset);
+      auto oldAttrs = fatPtrs.at({fatPtrBase, fatPtrOffset});
+      rewriter.replaceOpWithMultiple(addPtrOp, {{fatPtrBase, combined}});
+      fatPtrs[{fatPtrBase, combined}] = oldAttrs;
+      return success();
+    }
 
     if (fatPtrs.at({fatPtrBase, fatPtrOffset}).isSmallTensor)
       return rewriteSmallTensorPtr(addPtrOp, adaptor, rewriter);
@@ -1754,6 +1783,14 @@ static const std::string kInitFuncArgsRewritten =
 /// unrealized_cast is then (possibly) materialized in the second pass
 /// (ConvertUnimplementedOpUnrealizedCasts) if it wasn't DCEd (via a user
 /// extracting the tt.ptr and c0 operands).
+static bool hasPointerAccessRange(tt::FuncOp func) {
+  return llvm::any_of(llvm::seq<unsigned>(0, func.getNumArguments()),
+                      [&](unsigned idx) {
+                        return func.getArgAttrOfType<IntegerAttr>(
+                                   idx, "tt.pointer_access_range") != nullptr;
+                      });
+}
+
 struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
   InitFuncPtrArgs(MLIRContext *context, FatPointers &fatPtrs,
                   bool enableLargeTensorPtrCanon_)
@@ -1766,18 +1803,23 @@ struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
       return failure();
 
     rewriter.setInsertionPointToStart(&newOp.getBody().front());
+    // Use one offset representation throughout an opted-in function: pointers
+    // can meet at selects, loop-carried arguments and control-flow joins.
+    bool preservePointerArithmetic = hasPointerAccessRange(newOp);
     for (auto [idx, arg] : llvm::enumerate(newOp.getArguments())) {
       // The pointer argument needs to be a scalar
       if (!isa<tt::PointerType>(arg.getType()))
         continue;
 
       unsigned bitness = 64;
-      if (auto pointerRangeAttr =
-              newOp.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
-        bitness = pointerRangeAttr.getInt();
+      if (!preservePointerArithmetic)
+        if (auto pointerRangeAttr =
+                newOp.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
+          bitness = pointerRangeAttr.getInt();
 
       LDBG(idx << "-th argument: " << arg << ", bitness: " << bitness);
-      if (!enableLargeTensorPtrCanon && (bitness == 64)) {
+      if (!enableLargeTensorPtrCanon && (bitness == 64) &&
+          !preservePointerArithmetic) {
         LDBG("Do not init argument of large-tensor pointer: " << arg);
         continue;
       }
@@ -1788,7 +1830,9 @@ struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
           rewriter, arg.getLoc(), TypeRange{arg.getType()},
           ValueRange{arg, zeroOffset});
       rewriter.replaceAllUsesExcept(arg, dummyCast.getResult(0), dummyCast);
-      fatPtrs[{arg, zeroOffset}].canNarrow = true;
+      fatPtrs[{arg, zeroOffset}].canNarrow = !preservePointerArithmetic;
+      fatPtrs[{arg, zeroOffset}].preservePointerArithmetic =
+          preservePointerArithmetic;
       if (bitness != 64)
         fatPtrs[{arg, zeroOffset}].isSmallTensor = true;
     }
@@ -1998,6 +2042,60 @@ static void getForwardSliceImpl(OpOperand *use, Operation *op,
   forwardSlice->insert(op);
 }
 
+// Unknown pointer producers can meet tracked pointers at region joins. Keep the
+// original IR in that case rather than mixing one-value pointers with fat
+// pairs. Buffer conversion can still handle accesses directly based on
+// annotated args.
+static bool supportsAccessRangeCanonicalization(tt::FuncOp func) {
+  if (llvm::any_of(func.getArgumentTypes(), [](Type type) {
+        return isa<RankedTensorType>(type) &&
+               isa<tt::PointerType>(getElementTypeOrSelf(type));
+      }))
+    return false;
+  if (llvm::any_of(func.getResultTypes(), [](Type type) {
+        return isa<tt::PointerType>(getElementTypeOrSelf(type));
+      }))
+    return false;
+  bool supported = true;
+  func.walk([&](Operation *op) {
+    if (auto whileOp = dyn_cast<scf::WhileOp>(op))
+      if (llvm::any_of(whileOp.getResultTypes(),
+                       [](Type type) { return type.isInteger(1); }))
+        supported = false;
+    bool producesPointer = llvm::any_of(op->getResultTypes(), [](Type type) {
+      return isa<tt::PointerType>(getElementTypeOrSelf(type));
+    });
+    if (producesPointer &&
+        !isa<tt::AddPtrOp, tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp,
+             tt::ReshapeOp, tt::amdgpu::ExtractSliceOp,
+             tt::gpu::ConvertLayoutOp, arith::SelectOp, scf::IfOp, scf::ForOp,
+             scf::WhileOp>(op))
+      supported = false;
+    // A tensor select may materialize differing scalar bases. A surrounding
+    // loop would then mix a one-value yield with a two-value carried pointer.
+    if (auto select = dyn_cast<arith::SelectOp>(op))
+      if (producesPointer &&
+          isa<RankedTensorType>(select.getCondition().getType()))
+        supported = false;
+    bool consumesPointer = llvm::any_of(op->getOperandTypes(), [](Type type) {
+      return isa<tt::PointerType>(getElementTypeOrSelf(type));
+    });
+    if (consumesPointer &&
+        !isa<tt::AddPtrOp, tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp,
+             tt::ReshapeOp, tt::amdgpu::ExtractSliceOp,
+             tt::gpu::ConvertLayoutOp, arith::SelectOp, scf::IfOp, scf::ForOp,
+             scf::WhileOp, scf::YieldOp, scf::ConditionOp, cf::BranchOp,
+             cf::CondBranchOp, tt::LoadOp, tt::StoreOp, tt::PtrToIntOp,
+             tt::AtomicLoadOp, tt::AtomicStoreOp, tt::AtomicCASOp,
+             tt::AtomicPollOp, tt::AtomicRMWOp, tt::MakeTensorDescOp,
+             tt::gpu::AsyncCopyGlobalToLocalOp, tt::CallOp,
+             tt::ExternElementwiseOp, tt::ElementwiseInlineAsmOp, tt::PrintOp,
+             tt::ReturnOp>(op))
+      supported = false;
+  });
+  return supported;
+}
+
 void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   LLVM_DEBUG({
     llvm::dbgs() << "before tritonamdgpu-canonicalize-pointers\n";
@@ -2006,6 +2104,11 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
   });
 
   auto func = getOperation();
+  if (hasPointerAccessRange(func) &&
+      !supportsAccessRangeCanonicalization(func)) {
+    LDBG("keep original pointers for unsupported access-range pointer forms");
+    return;
+  }
   auto walkResult = func->walk<WalkOrder::PreOrder>([](ub::PoisonOp op) {
     op.emitRemark("skipping canonicalize-pointers due to ub.poison");
     return WalkResult::interrupt();
@@ -2026,11 +2129,13 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       continue;
 
     int64_t bitness = 64;
-    if (auto pointerRangeAttr =
-            func.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
-      bitness = pointerRangeAttr.getInt();
+    if (!hasPointerAccessRange(func))
+      if (auto pointerRangeAttr =
+              func.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
+        bitness = pointerRangeAttr.getInt();
 
-    if (!enableLargeTensorPtrCanon && (bitness == 64)) {
+    if (!enableLargeTensorPtrCanon && (bitness == 64) &&
+        !hasPointerAccessRange(func)) {
       LDBG("ignore " << idx << "-th argument of large-tensor ptr: " << arg);
       continue;
     }

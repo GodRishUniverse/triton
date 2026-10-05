@@ -109,7 +109,8 @@ bool isByteOffsetSmallerThan2GB(triton::AddPtrOp addPtrOp,
   return byteOfst <= szLimit2GB;
 }
 
-bool isFuncArgWith32bitPtrRange(mlir::Value value) {
+bool isFuncArgWith32bitPtrRange(mlir::Value value,
+                                StringRef attrName = "tt.pointer_range") {
   if (value.getDefiningOp())
     return false;
 
@@ -121,7 +122,7 @@ bool isFuncArgWith32bitPtrRange(mlir::Value value) {
     for (auto [idx, arg] : llvm::enumerate(funcOp.getArguments())) {
       if (arg != value)
         continue;
-      auto attr = funcOp.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range");
+      auto attr = funcOp.getArgAttrOfType<IntegerAttr>(idx, attrName);
       return attr && attr.getInt() <= 32;
     }
   }
@@ -162,8 +163,12 @@ bool canUseBufferOps(Value ptr,
   // or range analysis.
   bool isSafe = false;
   if (!analyzeSmallTensorOfst &&
-      isFuncArgWith32bitPtrRange(maybeSplatOp.getSrc())) {
-    LDBG("base-ptr has tt.pointer_range=32 attribute");
+      (isFuncArgWith32bitPtrRange(maybeSplatOp.getSrc()) ||
+       isFuncArgWith32bitPtrRange(maybeSplatOp.getSrc(),
+                                  "tt.pointer_access_range"))) {
+    // The access-range assertion is used only here. Its i64 offset remains
+    // intact for other users, including ptr_to_int and pointer comparisons.
+    LDBG("base-ptr has a 32-bit pointer or access range attribute");
     isSafe = true;
   } else {
     isSafe = isByteOffsetSmallerThan2GB(addPtrOp, std::move(solver));

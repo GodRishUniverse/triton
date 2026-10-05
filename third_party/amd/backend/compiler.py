@@ -285,6 +285,12 @@ class HIPOptions:
     instrumentation_mode: str = ""
     fpsan_homomorphic_casts: bool = False
 
+    # Source pointer argument names whose live accesses are within the first
+    # 2**31 - 1 bytes from the argument. This authorizes narrowing only at buffer
+    # accesses, not in observable pointer arithmetic. Incorrect assertions can
+    # silently produce incorrect results.
+    assume_pointer_access_range_32: Tuple[str, ...] = ()
+
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
     schedule_hint: str = ''
@@ -298,6 +304,10 @@ class HIPOptions:
     wgp_cu_mode: str = "wgp"
 
     def __post_init__(self):
+        names = self.assume_pointer_access_range_32
+        if isinstance(names, str) or any(type(name) is not str or not name for name in names):
+            raise ValueError("assume_pointer_access_range_32 must contain source argument names")
+        object.__setattr__(self, "assume_pointer_access_range_32", tuple(sorted(set(names))))
         if self.wgp_cu_mode not in ("wgp", "cu"):
             raise ValueError("wgp_cu_mode must be 'wgp' or 'cu'")
         # The arch without the "-strict" suffix.
@@ -827,6 +837,8 @@ class HIPBackend(BaseBackend):
         return ret
 
     def add_stages(self, stages, options, language):
+        if options.assume_pointer_access_range_32 and language != Language.TRITON:
+            raise ValueError("assume_pointer_access_range_32 is supported only for Triton kernels, not Gluon")
         if language == Language.TRITON:
             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)

@@ -1770,7 +1770,17 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     for path, value in src.constants.items():
         apply_constexpr_types(arg_types, list(path)[::-1], value)
 
-    prototype = ASTFunction([], arg_types, src.attrs)
+    attrs = dict(src.attrs)
+    for name in getattr(options, "assume_pointer_access_range_32", ()):
+        if fn.is_gluon():
+            raise ValueError("assume_pointer_access_range_32 is supported only for Triton kernels, not Gluon")
+        if name not in fn.arg_names:
+            raise ValueError(f"assume_pointer_access_range_32 argument {name!r} does not exist")
+        index = fn.arg_names.index(name)
+        if not isinstance(arg_types[index], language.pointer_type) or arg_types[index].address_space != "global":
+            raise ValueError(f"assume_pointer_access_range_32 argument {name!r} must be a scalar source pointer")
+        attrs[(index, )] = [*attrs.get((index, ), []), ("tt.pointer_access_range", 32)]
+    prototype = ASTFunction([], arg_types, attrs)
     # query function representation
     from collections import namedtuple
     leaves = filter(lambda v: len(v) == 1, src.constants)

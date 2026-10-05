@@ -177,3 +177,42 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.th
     tt.return %v : tensor<256x64xf16, #blocked6>
   }
 }
+
+// -----
+
+#access = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @access_range_local_truncation
+  tt.func @access_range_local_truncation(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}, %b: !tt.ptr<i8>, %offset: tensor<64xi64, #access>) -> tensor<64xi64, #access> {
+    %base = tt.splat %a : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #access>
+    // CHECK: %[[PTR:.*]] = tt.addptr %{{.*}}, %arg2 : tensor<64x!tt.ptr<i8>, {{.*}}>, tensor<64xi64,
+    %p = tt.addptr %base, %offset : tensor<64x!tt.ptr<i8>, #access>, tensor<64xi64, #access>
+    // CHECK: arith.trunci %arg2 : tensor<64xi64,
+    // CHECK: amdg.buffer_load
+    %v = tt.load %p : tensor<64x!tt.ptr<i8>, #access>
+    // CHECK: tt.ptr_to_int %[[PTR]]
+    %i = tt.ptr_to_int %p : tensor<64x!tt.ptr<i8>, #access> -> tensor<64xi64, #access>
+    %unselected = tt.splat %b : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #access>
+    %q = tt.addptr %unselected, %offset : tensor<64x!tt.ptr<i8>, #access>, tensor<64xi64, #access>
+    // CHECK: tt.store
+    // CHECK-NOT: amdg.buffer_store
+    tt.store %q, %v : tensor<64x!tt.ptr<i8>, #access>
+    tt.return %i : tensor<64xi64, #access>
+  }
+}
+
+// -----
+
+#derived = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @access_range_derived_base_not_trusted
+  // CHECK-NOT: amdg.buffer_load
+  // CHECK: tt.load
+  tt.func @access_range_derived_base_not_trusted(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}, %shift: i64, %offset: tensor<64xi64, #derived>) -> tensor<64xi8, #derived> {
+    %shifted = tt.addptr %a, %shift {tt.pointer_access_range = 32 : i32} : !tt.ptr<i8>, i64
+    %base = tt.splat %shifted : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #derived>
+    %p = tt.addptr %base, %offset : tensor<64x!tt.ptr<i8>, #derived>, tensor<64xi64, #derived>
+    %v = tt.load %p : tensor<64x!tt.ptr<i8>, #derived>
+    tt.return %v : tensor<64xi8, #derived>
+  }
+}
