@@ -2058,10 +2058,23 @@ static bool supportsAccessRangeCanonicalization(tt::FuncOp func) {
     return false;
   bool supported = true;
   func.walk([&](Operation *op) {
-    if (auto whileOp = dyn_cast<scf::WhileOp>(op))
-      if (llvm::any_of(whileOp.getResultTypes(),
-                       [](Type type) { return type.isInteger(1); }))
+    if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      // ConvertSCFWhileOp maps each init argument to a result. SCF also
+      // permits different input and result signatures, which that mapping
+      // cannot represent after a pointer expands to a (base, offset) pair.
+      auto isPointerType = [](Type type) {
+        return isa<tt::PointerType>(getElementTypeOrSelf(type));
+      };
+      bool hasPointerSignature =
+          llvm::any_of(whileOp.getInits().getTypes(), isPointerType) ||
+          llvm::any_of(whileOp.getResultTypes(), isPointerType);
+      if (hasPointerSignature &&
+          (!llvm::equal(whileOp.getInits().getTypes(),
+                        whileOp.getResultTypes()) ||
+           llvm::any_of(whileOp.getResultTypes(),
+                        [](Type type) { return type.isInteger(1); })))
         supported = false;
+    }
     bool producesPointer = llvm::any_of(op->getResultTypes(), [](Type type) {
       return isa<tt::PointerType>(getElementTypeOrSelf(type));
     });

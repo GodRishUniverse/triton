@@ -129,3 +129,77 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     tt.return %i : i64
   }
 }
+
+// -----
+
+// SCF permits different input and result signatures. The pointer pass must
+// leave this loop intact instead of replacing its one result with two values.
+module attributes {"ttg.num-warps" = 4} {
+  // CHECK-LABEL: @access_range_while_different_signatures
+  // CHECK: scf.while {{.*}} : (!tt.ptr<i8>, i32) -> !tt.ptr<i8>
+  // CHECK: tt.addptr {{.*}} !tt.ptr<i8>, i32
+  tt.func @access_range_while_different_signatures(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}) -> i64 {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %p = scf.while (%pointer = %a, %count = %zero) : (!tt.ptr<i8>, i32) -> !tt.ptr<i8> {
+      %continue = arith.cmpi slt, %count, %one : i32
+      scf.condition(%continue) %pointer : !tt.ptr<i8>
+    } do {
+    ^bb0(%pointer: !tt.ptr<i8>):
+      %next = tt.addptr %pointer, %one : !tt.ptr<i8>, i32
+      scf.yield %next, %one : !tt.ptr<i8>, i32
+    }
+    %i = tt.ptr_to_int %p : !tt.ptr<i8> -> i64
+    tt.return %i : i64
+  }
+}
+
+// -----
+
+// An i1 loop that does not carry a pointer must not disable pointer
+// canonicalization for an otherwise eligible pointer expression in the same
+// function. This test checks canonicalization, not buffer-op conversion.
+module attributes {"ttg.num-warps" = 4} {
+  // CHECK-LABEL: @access_range_unrelated_bool_while
+  // CHECK: scf.while
+  // CHECK: arith.extsi {{.*}} : i32 to i64
+  // CHECK: tt.addptr {{.*}} : !tt.ptr<i8>, i64
+  tt.func @access_range_unrelated_bool_while(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}, %x: i32, %live: i1) -> i64 {
+    %false = arith.constant false
+    %zero = arith.constant 0 : i32
+    %done = scf.while (%flag = %live) : (i1) -> i1 {
+      scf.condition(%flag) %flag : i1
+    } do {
+    ^bb0(%flag: i1):
+      scf.yield %false : i1
+    }
+    %offset = arith.select %done, %x, %zero : i32
+    %p = tt.addptr %a, %offset : !tt.ptr<i8>, i32
+    %i = tt.ptr_to_int %p : !tt.ptr<i8> -> i64
+    tt.return %i : i64
+  }
+}
+
+// -----
+
+// A while can also create a pointer result from integer init state. Check both
+// sides of its signature before expanding any pointer into a pair.
+module attributes {"ttg.num-warps" = 4} {
+  // CHECK-LABEL: @access_range_while_pointer_result
+  // CHECK: scf.while {{.*}} : (i32) -> !tt.ptr<i8>
+  // CHECK: tt.addptr {{.*}} !tt.ptr<i8>, i32
+  tt.func @access_range_while_pointer_result(%a: !tt.ptr<i8> {tt.pointer_access_range = 32 : i32}) -> i64 {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %p = scf.while (%count = %zero) : (i32) -> !tt.ptr<i8> {
+      %continue = arith.cmpi slt, %count, %one : i32
+      %next = tt.addptr %a, %count : !tt.ptr<i8>, i32
+      scf.condition(%continue) %next : !tt.ptr<i8>
+    } do {
+    ^bb0(%pointer: !tt.ptr<i8>):
+      scf.yield %one : i32
+    }
+    %i = tt.ptr_to_int %p : !tt.ptr<i8> -> i64
+    tt.return %i : i64
+  }
+}

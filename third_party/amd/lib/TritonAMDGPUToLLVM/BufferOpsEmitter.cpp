@@ -78,7 +78,10 @@ Value BufferEmitter::createResourceDescriptor(Value basePtr) {
   Value stride = b.int_val(16, 0);
   Value flagsConst = b.int_val(32, flags);
   Type rsrcType = LLVM::LLVMPointerType::get(rewriter.getContext(), 8);
-  Value numRecordsByte = b.int_val(64, std::numeric_limits<int>::max() - 1);
+  // The access-range assertion permits byte offsets through INT_MAX - 1.
+  // num_records is the size in bytes, so the descriptor must cover INT_MAX
+  // bytes (with INT_MAX + 1 still available as the masked-out sentinel).
+  Value numRecordsByte = b.int_val(64, std::numeric_limits<int>::max());
 
   Value resource = rewriter.createOrFold<ROCDL::MakeBufferRsrcOp>(
       loc, rsrcType, basePtr, stride, numRecordsByte, flagsConst);

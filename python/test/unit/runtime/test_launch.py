@@ -225,13 +225,14 @@ def test_pointer_access_range_full_width_boundary(fresh_knobs):
         offset = tl.load(offsets + lanes)
         tl.store(out + lanes, tl.load(src + offset))
 
-    src = torch.empty(2**29 + 4, device="cuda", dtype=torch.float32)
-    # The last live access ends at byte 2**31 - 4, inside the exclusive bound.
-    offsets = torch.arange(2**29 - 5, 2**29 - 1, device="cuda", dtype=torch.int64)
-    src[offsets] = torch.arange(4, device="cuda", dtype=torch.float32) + 7
-    out = torch.empty(4, device="cuda", dtype=torch.float32)
+    src = torch.empty(2**31 + 4, device="cuda", dtype=torch.uint8)
+    # The last live byte is at offset 2**31 - 2, inside [0, 2**31 - 1).
+    offsets = torch.arange(2**31 - 5, 2**31 - 1, device="cuda", dtype=torch.int64)
+    expected = torch.arange(4, device="cuda", dtype=torch.uint8) + 7
+    src[offsets] = expected
+    out = torch.empty(4, device="cuda", dtype=torch.uint8)
     compiled = kernel[(1, )](src, offsets, out, assume_pointer_access_range_32=("src", ))
-    torch.testing.assert_close(out, torch.arange(4, device="cuda", dtype=torch.float32) + 7, atol=0, rtol=0)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
     assert "buffer_load" in compiled.asm["amdgcn"]
 
 
